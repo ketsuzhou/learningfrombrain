@@ -1,0 +1,8 @@
+.DS_Store
+\data
+__pycache__
+*.cache*
+*.tar*
+\results
+\src\results
+\tests\data
