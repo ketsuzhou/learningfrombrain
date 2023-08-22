@@ -109,7 +109,7 @@ class EmbeddingModel(torch.nn.Module):
         layer_stack.extend(
             [
                 torch.nn.Linear(
-                    in_features=16,
+                    in_features=8,
                     out_features=self.embed_dim
                 ),
                 torch.nn.LayerNorm(self.embed_dim),
@@ -145,7 +145,7 @@ class EmbeddingModel(torch.nn.Module):
         inputs,
         **kwargs
         ) -> torch.tensor:
-        inputs_stacked = self._stack_inputs(tensor=inputs).reshape(-1, 64, 16)
+        inputs_stacked = self._stack_inputs(tensor=inputs).reshape(-1, 128, 8)
         
         return self._unstack_inputs(
             tensor=self.model(inputs_stacked),

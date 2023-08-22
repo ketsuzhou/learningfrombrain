@@ -108,7 +108,7 @@ class CrossAttentionM(CrossAttention):
         super().__init__(dim=dim, dim_head=dim_head, heads=heads)
         self.fast_attention = FastAttentionM(dim_head)
 
-    def forward(self, x, pos_emb = None, context = None, mask = None, context_mask = None, **kwargs):
+    def forward(self, x, pos_emb=None, context=None, mask=None, context_mask=None, **kwargs):
         h= self.heads
 
         cross_attend = exists(context)
@@ -117,24 +117,23 @@ class CrossAttentionM(CrossAttention):
         context_mask = default(context_mask, mask) if not cross_attend else context_mask
 
         q, k, v = self.to_q(x.reshape(-1, x.size(-2), x.size(-1))), self.to_k(context), self.to_v(context)
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q, k, v))
+        pos_k, pos_v = self.to_k(pos_emb).unsqueeze(0), self.to_v(pos_emb).unsqueeze(0)
+
+        q, k, v, pos_k, pos_v = map(
+            lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q, k, v, pos_k, pos_v))
+        # k, v = k + pos_k, v + pos_v
+
 
         k, v = k.unsqueeze(0), v.unsqueeze(0)
-        s = k.size(-2) *2 // 50
-        k, v = torch.cat([k[:, :, :, :-s], k[:, :, :, s:]], dim=0), torch.cat(
-            [v[:, :, :, :-s], v[:, :, :, s:]], dim=0)
+        s = k.size(-2) // 50
+        k = torch.cat([k[:, :, :, :-(2*s)] + pos_k, k[:, :, :, s:(-s)] + pos_k], dim=0)
+        v = torch.cat([v[:, :, :, :-(2*s)] + pos_v, v[:, :, :, s:(-s)] + pos_v], dim=0)
+
         k, v = k.reshape(-1, *k.size()[-3:]), v.reshape(-1, *v.size()[-3:])
 
         attn_outs = []
 
         if not empty(q):
-            if exists(context_mask):
-                global_mask = context_mask[:, None, :, None]
-                v.masked_fill_(~global_mask, 0.)
-
-            if exists(pos_emb) and not cross_attend:
-                q, k = apply_rotary_pos_emb(q, k, pos_emb)
-
             out, q_unnorm, k_unnorm  = self.fast_attention(q, k, v)
             attn_outs.append(out)
 
@@ -142,8 +141,6 @@ class CrossAttentionM(CrossAttention):
         out = rearrange(out, 'b h n d -> b n (h d)')
         out =  self.to_out(out)
         return self.dropout(out), q_unnorm, k_unnorm
-
-
 
 
 class Block(nn.Module):
@@ -157,35 +154,20 @@ class Block(nn.Module):
         self.ln_3 = nn.LayerNorm(dim_embd, eps=config.layer_norm_epsilon)
         self.ln_4 = nn.LayerNorm(dim_p_embd, eps=config.layer_norm_epsilon)
         self.mlp1 = MLP(4 * dim_embd, config)
-        self.mlp2 = MLP( dim_p_embd, config, nx=dim_p_embd)
+        self.mlp2 = MLP(dim_p_embd, config, nx=dim_p_embd)
         # self.attn = FastAttention(dim_heads = 64, nb_features = 256)
 
-        self.attn = CrossAttentionM(dim=dim_p_embd, dim_head=16, heads=8)
-        self.attn.to_q = nn.Linear(dim_p_embd, dim_p_embd, bias = False)
-        self.attn.to_k = nn.Linear(dim_embd, dim_p_embd, bias = False)
-        self.attn.to_v = nn.Linear(dim_embd, dim_p_embd, bias = False)
+        self.attn = CrossAttentionM(dim=dim_p_embd, dim_head=config.dim_head, heads=config.heads)
+        self.attn.to_q = nn.Linear(dim_p_embd, config.dim_head*config.heads, bias = False)
+        self.attn.to_k = nn.Linear(dim_embd, config.dim_head*config.heads, bias = False)
+        self.attn.to_v = nn.Linear(dim_embd, config.dim_head*config.heads, bias = False)
 
-    def forward(self, i, x, y):
+    def forward(self, i, x, y, pos):
         y = self.mlp2(self.ln_4(y)) + y
-        output_attn, q_unnorm, k_unnorm = self.attn(self.ln_1(y),
-                                context=self.ln_2(x))
-        # a = output_attn[0]  # output_attn: a, present, (attentions)
+        output_attn, q_unnorm, k_unnorm = self.attn(
+            self.ln_1(y), pos_emb=pos, context=self.ln_2(x))
+
         y = y + output_attn.reshape(*y.size())
-
-        # outputs = [x] + [y] + output_attn[1:]
-        # outputs = [x] + [y]
-
-        # if i % 3 == 0:
-        #     output_attn = self.attn(self.ln_1(x),
-        #                             self.ln_2(y),
-        #                             attention_mask=attention_mask,
-        #                             head_mask=head_mask)
-        #     a = output_attn[0]  # output_attn: a, present, (attentions)
-        #     y = y + a
-
-        #     outputs = [x] + [y] + output_attn[1:]
-        # else:
-        #     outputs = [x] + [y]
         return y, q_unnorm.unsqueeze(2), k_unnorm.unsqueeze(2)
 
 class MlpBlock(nn.Module):
@@ -199,7 +181,34 @@ class MlpBlock(nn.Module):
         x = self.mlp1(self.ln_1(x)) + x
         return x  
 
+class Encoder(nn.Module):
+    def __init__(self, dim):
+        super(Encoder, self).__init__()
 
+        self.ln = nn.LayerNorm(dim, eps=1e-05)
+        self.c1 = Conv1D(dim//2, dim)
+        self.c2 = Conv1D(dim//2,  dim//2)
+        self.act = gelu
+
+    def forward(self, x):
+        x = self.c1(self.ln(x))
+        x = self.c2(self.act(x)) + x
+        return x
+
+class Decoder(nn.Module):
+    def __init__(self, dim):
+        super(Decoder, self).__init__()
+
+        self.ln = nn.LayerNorm(dim, eps=1e-05)
+        self.c1 = Conv1D(dim*2, dim)
+        self.c2 = Conv1D(dim*2,  dim*2)
+        self.act = gelu
+
+    def forward(self, x):
+        x = self.c1(self.ln(x))
+        x = self.c2(self.act(x)) + x
+        return x
+    
 class KoopmanModel(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -218,12 +227,14 @@ class KoopmanModel(nn.Module):
             "layer_norm_epsilon": 1e-05,
             "model_type": "gpt2",
             "n_ctx": 1024,
-            "dim_embd": 32,
-            "dim_p_embd": 128,
+            "dim_embd": 10,
+            "dim_p_embd": 64,
             "n_head": 4,
-            "n_layer": 8,
+            "n_layer": 16,
+            "dim_head": 10,
+            "heads": 6,
             "t_positions": 50,
-            "s_positions": 64,
+            "s_positions": 128,
             "output_attentions": True,
             # "output_hiddedim_embds": False,
             "pruned_heads": {},
@@ -254,12 +265,16 @@ class KoopmanModel(nn.Module):
         self.drop = nn.Dropout(config.embd_pdrop)
         self.h = nn.ModuleList([Block(config.n_ctx, config, scale=True) for _ in range(config.n_layer)])
 
-        self.ln_f = nn.ModuleList([MlpBlock(config.dim_embd, config) for _ in range(2)])
+
+        self.encoder = nn.ModuleList([Encoder(6144//(2**i)) for i in range(4)])
+        self.decoder = nn.ModuleList([Decoder(6144//(2**(4-i))) for i in range(4)])
 
         self.mlp = nn.Linear(config.dim_embd, config.dim_p_embd)
 
-        self.mlp1 = nn.Linear(config.dim_p_embd, config.dim_embd)
-        self.mlp2 = nn.Linear(config.dim_embd, 16)
+        self.mlp1 = nn.Linear(config.dim_p_embd, config.dim_p_embd//2)
+        self.ln_f = nn.ModuleList([MlpBlock(config.dim_p_embd//2, config) for _ in range(1)])
+
+        self.mlp2 = nn.Linear(config.dim_p_embd//2, 1024//config.s_positions)
         # self.mlp3 = nn.Linear(400, 16)
 
         self.w0 = nn.Parameter(
@@ -364,25 +379,15 @@ class KoopmanModel(nn.Module):
         time_ids = torch.arange(0, t_length, dtype=torch.long, device=device)
         space_ids = torch.arange(0, s_length, dtype=torch.long, device=device)
 
-
-        head_mask = [None] * self.config.n_layer
-
-        position_embeds = self.te(time_ids).unsqueeze(1)
+        time_embeds = self.te(time_ids).unsqueeze(1)
         space_embeds = self.se(space_ids).unsqueeze(0)
 
-        pred_token = self.mlp(position_embeds[-2:] + space_embeds).unsqueeze(0)
+        pred_token = self.mlp(time_embeds[-2:] + space_embeds).unsqueeze(0)
         dtype = pred_token.dtype
-        hiddedim_embds = inputs_embeds + position_embeds + space_embeds
+        # hiddedim_embds = inputs_embeds + time_embeds + space_embeds
+        pos_embeds = time_embeds[:-2] + space_embeds
         # hiddedim_embds = inputs_embeds + space_embeds
-        hiddedim_embds = self.drop(hiddedim_embds).to(dtype)
-
-        presents = ()
-
-        # attention_mask = torch.tril(torch.ones(t_length-1, t_length, device=device), diagonal=0
-        #                             ).unsqueeze(1).unsqueeze(3).repeat(1, s_length, 1, s_length).view((t_length-1)*s_length, -1)
-
-        # attention_mask = torch.tril(
-        #     torch.ones(t_length-1, t_length, device=device), diagonal=0).unsqueeze(-1).repeat(1, 1, s_length).reshape(t_length-1, -1, len(self.h)).permute(2, 0, 1).to(dtype).unsqueeze(-1)
+        hiddedim_embds = self.drop(inputs_embeds).to(dtype)
 
         B = hiddedim_embds.size()[0]
         # prod1 = hiddedim_embds.size()[1] * hiddedim_embds.size()[2]
@@ -392,6 +397,8 @@ class KoopmanModel(nn.Module):
         # hiddedim_embds2 = hiddedim_embds[:, 1:]
         hiddedim_embds = hiddedim_embds.reshape(
             B, -1, len(self.h),  hiddedim_embds.size(-1)).permute(2, 0, 1, 3)
+        pos_embeds = pos_embeds.reshape(
+            -1, len(self.h),  pos_embeds.size(-1)).permute(1, 0, 2)
 
         # hiddedim_embds = hiddedim_embds.view(B, -1, hiddedim_embds.size(-1))
         pred_token = pred_token.permute(1, 0, 2, 3).repeat(1, B, 1, 1)
@@ -399,11 +406,8 @@ class KoopmanModel(nn.Module):
         all_qs = []
         all_ks = []
         for i, block in enumerate(self.h):
-            pred_token, q, k = block(i, hiddedim_embds[i], pred_token)
+            pred_token, q, k = block(i, hiddedim_embds[i], pred_token, pos_embeds[i])
 
-            # _, pred_token = outputs[:2]
-
-            # if self.output_attentions and (i%3==0):
             all_qs.append(q)
             all_ks.append(k)
 
@@ -412,28 +416,36 @@ class KoopmanModel(nn.Module):
         all_qs = torch.cat(all_qs, 2) 
         all_ks = torch.cat(all_ks, 2) 
 
-        t = torch.einsum('...nld, nlc -> ...ndc',  all_ks, self.w0.to(all_ks.dtype))
-        s = torch.einsum('...hnld, ...hndc -> ...lcn',  all_qs, t) / t.size(1)
+        # t = torch.einsum('...nld, nlc -> ...ndc',  all_ks, self.w0.to(all_ks.dtype))
+        # s = torch.einsum('...hnld, ...hndc -> ...lcn',  all_qs, t) / t.size(1)
+        # s = s.reshape(2, B, s.size(1), -1)
 
-        aa = s /100
+        c = torch.einsum('bhnld, bhncd -> blcn',  all_qs, all_ks) / all_qs.size(1)
+        c = c.reshape(2, B, c.size(1), -1)
+
+        g = c[0]
+        for i, block in enumerate(self.encoder):
+            g = block(g)
+
+        g = torch.einsum('bnd, nl -> bld', g, self.w.to(g.dtype))
+
+        for i, block in enumerate(self.decoder):
+            g = block(g)
+
+        g_true = c[1]
+
+        loss1 = ((g_true - g.detach()) ** 2).mean()
+        loss2 = ((g_true.detach() - g) ** 2).mean()
+
         pred_token = self.mlp1(pred_token)
-        state = pred_token
-
+        # state = pred_token
         for i, block in enumerate(self.ln_f):
             pred_token = block(pred_token)
 
-        pred_token = self.mlp2(pred_token).view(B, t_length-1, -1)
-        mse_loss = ((pred_token - inputs[:, 1:]) ** 2).sum(-1).mean()
-        a, b = state.reshape(B, t_length-1, s_length,-1)[:, :-1], state.reshape(
-            B, t_length-1, s_length,-1)[:, 1:]
+        pred_token = self.mlp2(pred_token).view(2, B, -1)
+        mse_loss = torch.abs(pred_token - inputs[:, -2:].permute(1, 0, 2)).sum(-1).mean()
 
-        b_pred = torch.einsum('basd, se -> baed', a, self.w.to(a.dtype))
-
-        loss1 = ((b_pred - b.detach()) ** 2).sum(-1).mean()
-
-        loss2 = ((b_pred.detach() - b) ** 2).sum(-1).mean()
-
-        loss = mse_loss + (loss1 + loss2) / 2
+        loss = mse_loss + loss1*0.2 + loss2*0.8
         return loss
     
 class DotDict(dict):

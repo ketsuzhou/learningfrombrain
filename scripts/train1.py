@@ -538,7 +538,7 @@ def get_args() -> argparse.ArgumentParser:
     parser.add_argument(
         '--embedding-dim',
         metavar='INT',
-        default=32,
+        default=10,
         type=int,
         help='dimension of input embedding '
              '(default: 768)'
